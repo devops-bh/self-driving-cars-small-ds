@@ -220,3 +220,80 @@ mpl_visualize_dataset_with_bboxes(
 mpl_visualize_dataset_with_bboxes(
     val_ds, bounding_box_format="xyxy", value_range=(0, 255), rows=2, cols=2, dataset_split_name="val"
 )
+
+
+def dict_to_tuple(inputs):
+    return inputs["images"], inputs["bounding_boxes"]
+
+
+train_ds = train_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
+
+val_ds = val_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
+
+backbone = keras_cv.models.YOLOV8Backbone.from_preset(
+    "yolo_v8_s_backbone_coco"  # We will use yolov8 small backbone with coco weights
+)
+
+yolo = keras_cv.models.YOLOV8Detector(
+    num_classes=len(class_mapping),
+    bounding_box_format="xyxy",
+    backbone=backbone,
+    fpn_depth=1,
+)
+
+optimizer = tf.keras.optimizers.Adam(
+    learning_rate=LEARNING_RATE,
+    global_clipnorm=GLOBAL_CLIPNORM,
+)
+
+"""
+# ValueError: Invalid box loss for YOLOV8Detector: ciou. Box loss should be a keras.Loss or the string 'iou'
+yolo.compile(
+    optimizer=optimizer, classification_loss="binary_crossentropy", box_loss="ciou"
+)
+"""
+
+#yolo.compile(optimizer=optimizer, classification_loss="binary_crossentropy", box_loss=keras_cv.losses.CIoULoss())
+
+# maybe investigate the difference between  Intersection over Union and Compute(d?) intersection over union https://github.com/keras-team/keras-cv/tree/master/keras_cv/src/losses
+# if they ultimately just do the same thing except perhaps with varied results I am ok with that
+yolo.compile(optimizer=optimizer, classification_loss="binary_crossentropy", box_loss="iou")
+
+class EvaluateCOCOMetricsCallback(keras.callbacks.Callback):
+    def __init__(self, data, save_path):
+        super().__init__()
+        self.data = data
+        self.metrics = keras_cv.metrics.BoxCOCOMetrics(
+            bounding_box_format="xyxy",
+            evaluate_freq=1e9,
+        )
+
+        self.save_path = save_path
+        self.best_map = -1.0
+
+    def on_epoch_end(self, epoch, logs):
+        self.metrics.reset_state()
+        for batch in self.data:
+            images, y_true = batch[0], batch[1]
+            y_pred = self.model.predict(images, verbose=0)
+            self.metrics.update_state(y_true, y_pred)
+
+        metrics = self.metrics.result(force=True)
+        logs.update(metrics)
+
+        current_map = metrics["MaP"]
+        if current_map > self.best_map:
+            self.best_map = current_map
+            self.model.save(self.save_path)  # Save the model when mAP improves
+
+        return logs
+
+
+
+yolo.fit(
+    train_ds,
+    validation_data=val_ds,
+    epochs=3#,callbacks=[EvaluateCOCOMetricsCallback(val_ds, "model.h5")],
+)
